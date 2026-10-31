@@ -1,0 +1,36 @@
+name: release
+
+# Formal Release only when someone pushes a tag v* (a new commit pointed at
+# by that tag). No schedule, no workflow_dispatch: docs-only pushes do not
+# rebuild or upload, and v1.0 assets are left untouched.
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake libcurl4-openssl-dev
+      - name: Fetch pinned portable GCC
+        run: bash scripts/fetch-toolchain.sh "$HOME/ps5ai-toolchain"
+      - name: Configure and build
+        run: |
+          cmake -S . -B build -DCMAKE_CXX_COMPILER=g++ -DCMAKE_BUILD_TYPE=Release -DPS5AI_STATIC_CXX=ON
+          cmake --build build -j"$(nproc)"
+      - name: Self-test with the bundled toolchain
+        run: PS5AI_TOOLCHAIN="$HOME/ps5ai-toolchain" ./build/ps5ai-11dim --self-test
+      - name: Pack archive
+        run: bash scripts/pack-release.sh build "$HOME/ps5ai-toolchain" dist
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          gh release create "$TAG" dist/*.tar.gz dist/SHA256SUMS \
+            --title "$TAG" \
+            --notes "Self-contained linux-amd64 bundle with portable g++ toolchain for dimension 3. Rebuilds only when this tag points at a new commit. Does not replace older tags such as v1.0."
