@@ -1,5 +1,6 @@
 #include "sandbox.hpp"
 
+#include "paths.hpp"
 #include "utf8.hpp"
 
 #include <nlohmann/json.hpp>
@@ -424,16 +425,115 @@ struct Range {
 };
 
 
-std::string gxx_binary() {
-    if (const char* env = std::getenv("PS5AI_GXX")) {
-        if (env[0] != '\0') {
-            return env;
+std::string& last_cxx_storage() {
+    static std::string value;
+    return value;
+}
+
+bool is_executable(const std::string& path) {
+    return !path.empty() && access(path.c_str(), X_OK) == 0;
+}
+
+bool compiler_accepts_version(const std::string& cxx) {
+    RunOptions opt;
+    opt.timeout_s = 5;
+    const ProcResult ver = run_process({cxx, "--version"}, opt);
+    return ver.exit_code == 0;
+}
+
+// Absolute paths must be executable. A bare name is accepted when `--version` runs.
+bool take_env_compiler(const char* key, std::string& out) {
+    const char* env = std::getenv(key);
+    if (env == nullptr || env[0] == '\0') {
+        return false;
+    }
+    const std::string path(env);
+    if (path.find('/') != std::string::npos) {
+        if (!is_executable(path)) {
+            return false;
+        }
+        out = path;
+        return true;
+    }
+    if (!compiler_accepts_version(path)) {
+        return false;
+    }
+    out = path;
+    return true;
+}
+
+std::string remember_cxx(std::string path) {
+    last_cxx_storage() = path;
+    return last_cxx_storage();
+}
+
+// /usr/bin/<name> first, then a PATH lookup via `--version` (execvp).
+std::string pick_named_compiler(const char* name) {
+    const std::string usr = std::string("/usr/bin/") + name;
+    if (is_executable(usr)) {
+        return usr;
+    }
+    if (compiler_accepts_version(name)) {
+        return name;
+    }
+    return {};
+}
+
+std::string resolve_cxx_impl() {
+    std::string picked;
+    if (take_env_compiler("PS5AI_CXX", picked)) {
+        return remember_cxx(std::move(picked));
+    }
+    if (take_env_compiler("PS5AI_GXX", picked)) {
+        return remember_cxx(std::move(picked));
+    }
+    if (const char* root = std::getenv("PS5AI_TOOLCHAIN")) {
+        if (root[0] != '\0') {
+            const std::string cand = std::string(root) + "/bin/g++";
+            if (is_executable(cand)) {
+                return remember_cxx(cand);
+            }
         }
     }
-    if (access("/usr/bin/g++", X_OK) == 0) {
-        return "/usr/bin/g++";
+    const std::string exe_dir = executable_dir();
+    if (!exe_dir.empty()) {
+        const std::string beside = exe_dir + "/toolchain/bin/g++";
+        if (is_executable(beside)) {
+            return remember_cxx(beside);
+        }
+        const std::string parent = exe_dir + "/../toolchain/bin/g++";
+        if (is_executable(parent)) {
+            return remember_cxx(parent);
+        }
     }
-    return "g++";
+    for (const char* name : {"g++", "clang++", "c++"}) {
+        const std::string found = pick_named_compiler(name);
+        if (!found.empty()) {
+            return remember_cxx(found);
+        }
+    }
+    return remember_cxx("c++");
+}
+
+std::string cxx_version_line_impl(const std::string& cxx) {
+    if (cxx.empty()) {
+        return {};
+    }
+    RunOptions opt;
+    opt.timeout_s = 5;
+    const ProcResult ver = run_process({cxx, "--version"}, opt);
+    if (ver.exit_code != 0) {
+        return {};
+    }
+    const auto pos = ver.stdout_text.find('\n');
+    std::string line = pos == std::string::npos ? ver.stdout_text : ver.stdout_text.substr(0, pos);
+    if (!line.empty() && line.back() == '\r') {
+        line.pop_back();
+    }
+    if (line.size() > 200) {
+        line.resize(200);
+    }
+    return line;
 }
 
 bool write_file_checked(const std::string& path, const std::string& content, std::string& err) {
@@ -460,6 +560,21 @@ std::string make_temp_dir() {
 }
 
 }  // namespace
+
+std::string resolve_cxx_compiler() {
+    return resolve_cxx_impl();
+}
+
+std::string last_resolved_cxx() {
+    if (last_cxx_storage().empty()) {
+        return resolve_cxx_impl();
+    }
+    return last_cxx_storage();
+}
+
+std::string cxx_version_line(const std::string& cxx) {
+    return cxx_version_line_impl(cxx);
+}
 
 std::string extract_longest_fence(const std::string& text) {
     const std::string fence = "```";
@@ -605,7 +720,7 @@ ScoreResult evaluate_code(const std::string& raw) {
                 std::filesystem::remove_all(path, ec);
             }
         } guard{dir};
-        const std::string gxx = gxx_binary();
+        const std::string gxx = resolve_cxx_compiler();
         const std::string syntax_path = dir + "/syntax.cpp";
         {
             std::string write_err;
@@ -618,7 +733,7 @@ ScoreResult evaluate_code(const std::string& raw) {
         syntax_opt.cwd = dir;
         const ProcResult syntax = run_process({gxx, "-std=c++17", "-fsyntax-only", "-pthread", syntax_path}, syntax_opt);
         if (syntax.exit_code == 127) {
-            return {0.0, {"[ENV_ERROR][+0] 未找到 g++（" + gxx + "），无法编译 C++17 沙盒"}};
+            return {0.0, {"[ENV_ERROR][+0] 未找到 C++ 编译器（" + gxx + "），无法编译 C++17 沙盒"}};
         }
         if (!syntax.error.empty() && syntax.exit_code < 0 && !syntax.timed_out) {
             return {0.0, {"[ENV_ERROR][+0] 启动编译失败: " + syntax.error}};
@@ -650,7 +765,7 @@ ScoreResult evaluate_code(const std::string& raw) {
         const ProcResult linked = run_process(
             {gxx, "-std=c++17", "-pthread", "-O0", "-o", binary, harness_path}, link_opt);
         if (linked.exit_code == 127) {
-            result.details.push_back("[ENV_ERROR][+0] 未找到 g++（" + gxx + "），链接失败");
+            result.details.push_back("[ENV_ERROR][+0] 未找到 C++ 编译器（" + gxx + "），链接失败");
             result.score = 0.0;
             return result;
         }
