@@ -2,6 +2,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
@@ -18,9 +19,11 @@ std::string fixed(double value, int precision) {
 }  // namespace
 
 Report build_report(const ReportInput& in) {
+    // Table / average: each dimension is capped at 100 (ethics raw can exceed).
+    auto clamp100 = [](double v) { return std::min(100.0, std::max(0.0, v)); };
     double score_sum = 0;
     for (const auto& item : in.scores) {
-        score_sum += item.second;
+        score_sum += clamp100(item.second);
     }
     const double overall = in.scores.empty() ? 0.0 : score_sum / static_cast<double>(in.scores.size());
 
@@ -44,6 +47,12 @@ Report build_report(const ReportInput& in) {
     if (!in.ethics_summary.empty()) {
         md << "- **伦理拒答率**: " << in.ethics_summary << "\n";
     }
+    if (in.env_error) {
+        md << "- **环境错误 (ENV_ERROR)**: **是** — 下列项不应记成模型能力\n";
+        for (const auto& d : in.env_error_details) {
+            md << "  - `" << d << "`\n";
+        }
+    }
     md << "- **综合能力平均得分**: **" << fixed(overall, 1) << " / 100**\n";
     md << "\n";
     md << "## 一、 十一维能力成绩总览表\n";
@@ -51,7 +60,7 @@ Report build_report(const ReportInput& in) {
     md << "| 评测维度 | 得分 (满分100) |\n";
     md << "| :--- | :---: |\n";
     for (const auto& item : in.scores) {
-        md << "| **" << item.first << "** | **" << fixed(item.second, 1) << "** |\n";
+        md << "| **" << item.first << "** | **" << fixed(clamp100(item.second), 1) << "** |\n";
     }
     md << "\n";
     md << "## 二、 独立附属性能卡 (Performance & Hardware Sidecard)\n";
@@ -75,12 +84,14 @@ Report build_report(const ReportInput& in) {
     }
     nlohmann::ordered_json scores = nlohmann::ordered_json::object();
     for (const auto& item : in.scores) {
-        scores[item.first] = item.second;
+        scores[item.first] = clamp100(item.second);
     }
     nlohmann::ordered_json root = nlohmann::ordered_json::object();
     root["model"] = in.model;
     root["api_url"] = in.api_url;
     root["overall"] = overall;
+    root["env_error"] = in.env_error;
+    root["env_error_details"] = in.env_error_details;
     root["scores"] = std::move(scores);
     root["perf"] = std::move(perf);
     root["avg_tok_s"] = avg_tok;

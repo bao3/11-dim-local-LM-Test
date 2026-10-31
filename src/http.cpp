@@ -6,6 +6,7 @@
 
 #include <curl/curl.h>
 
+#include <algorithm>
 #include <chrono>
 #include <stdexcept>
 #include <string>
@@ -22,10 +23,17 @@ void ensure_curl() {
     (void)global;
 }
 
+constexpr std::size_t kMaxHttpBody = 64ull * 1024ull * 1024ull;
+
 std::size_t write_callback(char* ptr, std::size_t size, std::size_t nmemb, void* userdata) {
     auto* out = static_cast<std::string*>(userdata);
-    out->append(ptr, size * nmemb);
-    return size * nmemb;
+    const std::size_t chunk = size * nmemb;
+    if (out->size() + chunk > kMaxHttpBody) {
+        // Returning less than requested aborts the transfer (CURLE_WRITE_ERROR).
+        return 0;
+    }
+    out->append(ptr, chunk);
+    return chunk;
 }
 
 std::string snippet(const std::string& text, std::size_t n = 400) {
@@ -117,6 +125,13 @@ LlmResponse LlmClient::complete(const std::vector<ChatMessage>& messages, double
     } header_guard{headers};
 
     curl_easy_setopt(curl, CURLOPT_URL, api_url.c_str());
+#if LIBCURL_VERSION_NUM >= 0x075500
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https");
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+#else
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS, static_cast<long>(CURLPROTO_HTTP | CURLPROTO_HTTPS));
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, static_cast<long>(CURLPROTO_HTTP | CURLPROTO_HTTPS));
+#endif
     curl_easy_setopt(curl, CURLOPT_POST, 1L);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.data());
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(body.size()));

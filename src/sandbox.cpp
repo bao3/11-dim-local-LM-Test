@@ -74,6 +74,10 @@ ProcResult run_process(const std::vector<std::string>& args, const RunOptions& o
         return result;
     }
     if (pid == 0) {
+        // Own process group so the parent can SIGKILL the whole tree (g++ → cc1plus, etc.).
+        if (setpgid(0, 0) != 0) {
+            setsid();
+        }
         if (!opt.cwd.empty() && chdir(opt.cwd.c_str()) != 0) {
             _exit(126);
         }
@@ -91,6 +95,13 @@ ProcResult run_process(const std::vector<std::string>& args, const RunOptions& o
             rl.rlim_cur = 16ull << 20;
             rl.rlim_max = rl.rlim_cur;
             setrlimit(RLIMIT_FSIZE, &rl);
+            rl.rlim_cur = 256ull << 20;
+            rl.rlim_max = rl.rlim_cur;
+            setrlimit(RLIMIT_AS, &rl);
+            // RLIMIT_NPROC is UID-wide (threads included). Keep high so harness threads are not EAGAIN.
+            rl.rlim_cur = 8192;
+            rl.rlim_max = 8192;
+            setrlimit(RLIMIT_NPROC, &rl);
         }
         std::vector<char*> argv;
         argv.reserve(args.size() + 1);
@@ -101,6 +112,8 @@ ProcResult run_process(const std::vector<std::string>& args, const RunOptions& o
         execvp(argv[0], argv.data());
         _exit(127);
     }
+    // Parent also sets child's pgid in case of race before child runs setpgid.
+    setpgid(pid, pid);
     close(out_pipe[1]);
     close(err_pipe[1]);
     fcntl(out_pipe[0], F_SETFL, O_NONBLOCK);
@@ -134,6 +147,13 @@ ProcResult run_process(const std::vector<std::string>& args, const RunOptions& o
         }
     };
 
+    auto kill_group = [&]() {
+        // Negative pid = process group. Fall back to the direct child if needed.
+        if (kill(-pid, SIGKILL) != 0) {
+            kill(pid, SIGKILL);
+        }
+    };
+
     while (out_open || err_open || !reaped) {
         if (!reaped) {
             const pid_t waited = waitpid(pid, &status, WNOHANG);
@@ -142,16 +162,15 @@ ProcResult run_process(const std::vector<std::string>& args, const RunOptions& o
             }
         }
         if (!reaped && std::chrono::steady_clock::now() > deadline) {
-            kill(pid, SIGKILL);
+            kill_group();
             waitpid(pid, &status, 0);
             reaped = true;
             result.timed_out = true;
         }
         if (result.stdout_text.size() + result.stderr_text.size() > kMaxCapture && !reaped) {
-            kill(pid, SIGKILL);
+            kill_group();
             waitpid(pid, &status, 0);
             reaped = true;
-            result.timed_out = true;
             result.error = "output exceeded 2MB";
         }
         pollfd fds[2];
@@ -175,13 +194,22 @@ ProcResult run_process(const std::vector<std::string>& args, const RunOptions& o
         if (err_open) {
             read_fd(err_pipe[0], result.stderr_text, err_open);
         }
-        if (reaped && !out_open && !err_open) {
+        if (reaped) {
+            // Drain once more, then stop: grandchildren must not hang us on open pipes.
+            if (out_open) {
+                read_fd(out_pipe[0], result.stdout_text, out_open);
+            }
+            if (err_open) {
+                read_fd(err_pipe[0], result.stderr_text, err_open);
+            }
             break;
         }
     }
     close(out_pipe[0]);
     close(err_pipe[0]);
     if (result.timed_out) {
+        result.exit_code = -1;
+    } else if (!result.error.empty() && result.error.find("output exceeded") != std::string::npos) {
         result.exit_code = -1;
     } else if (WIFEXITED(status)) {
         result.exit_code = WEXITSTATUS(status);
@@ -395,6 +423,34 @@ struct Range {
     std::size_t end = 0;
 };
 
+
+std::string gxx_binary() {
+    if (const char* env = std::getenv("PS5AI_GXX")) {
+        if (env[0] != '\0') {
+            return env;
+        }
+    }
+    if (access("/usr/bin/g++", X_OK) == 0) {
+        return "/usr/bin/g++";
+    }
+    return "g++";
+}
+
+bool write_file_checked(const std::string& path, const std::string& content, std::string& err) {
+    std::ofstream out(path, std::ios::binary);
+    if (!out) {
+        err = "failed to open " + path;
+        return false;
+    }
+    out << content;
+    out.flush();
+    if (!out) {
+        err = "failed to write " + path;
+        return false;
+    }
+    return true;
+}
+
 std::string make_temp_dir() {
     char tmpl[] = "/tmp/ps5ai-dim3-XXXXXX";
     if (mkdtemp(tmpl) == nullptr) {
@@ -549,17 +605,23 @@ ScoreResult evaluate_code(const std::string& raw) {
                 std::filesystem::remove_all(path, ec);
             }
         } guard{dir};
+        const std::string gxx = gxx_binary();
         const std::string syntax_path = dir + "/syntax.cpp";
         {
-            std::ofstream out(syntax_path, std::ios::binary);
-            out << kPreamble << "\n" << block << "\n";
+            std::string write_err;
+            if (!write_file_checked(syntax_path, std::string(kPreamble) + "\n" + block + "\n", write_err)) {
+                return {0.0, {"[ENV_ERROR][+0] 写沙盒文件失败: " + write_err}};
+            }
         }
         RunOptions syntax_opt;
         syntax_opt.timeout_s = 30;
         syntax_opt.cwd = dir;
-        const ProcResult syntax = run_process({"g++", "-std=c++17", "-fsyntax-only", "-pthread", syntax_path}, syntax_opt);
+        const ProcResult syntax = run_process({gxx, "-std=c++17", "-fsyntax-only", "-pthread", syntax_path}, syntax_opt);
         if (syntax.exit_code == 127) {
-            return {0.0, {"[+0] 未找到 g++，无法编译 C++17 沙盒"}};
+            return {0.0, {"[ENV_ERROR][+0] 未找到 g++（" + gxx + "），无法编译 C++17 沙盒"}};
+        }
+        if (!syntax.error.empty() && syntax.exit_code < 0 && !syntax.timed_out) {
+            return {0.0, {"[ENV_ERROR][+0] 启动编译失败: " + syntax.error}};
         }
         if (syntax.timed_out) {
             return {0.0, {"[+0] 编译超时"}};
@@ -574,14 +636,24 @@ ScoreResult evaluate_code(const std::string& raw) {
         const std::string harness_path = dir + "/harness.cpp";
         const std::string binary = dir + "/sched_test";
         {
-            std::ofstream out(harness_path, std::ios::binary);
-            out << kPreamble << "\n" << strip_main_functions(block) << "\n" << kHarness;
+            std::string write_err;
+            const std::string body = std::string(kPreamble) + "\n" + strip_main_functions(block) + "\n" + kHarness;
+            if (!write_file_checked(harness_path, body, write_err)) {
+                result.details.push_back("[ENV_ERROR][+0] 写沙盒 harness 失败: " + write_err);
+                result.score = 0.0;
+                return result;
+            }
         }
         RunOptions link_opt;
         link_opt.timeout_s = 30;
         link_opt.cwd = dir;
         const ProcResult linked = run_process(
-            {"g++", "-std=c++17", "-pthread", "-O0", "-o", binary, harness_path}, link_opt);
+            {gxx, "-std=c++17", "-pthread", "-O0", "-o", binary, harness_path}, link_opt);
+        if (linked.exit_code == 127) {
+            result.details.push_back("[ENV_ERROR][+0] 未找到 g++（" + gxx + "），链接失败");
+            result.score = 0.0;
+            return result;
+        }
         if (linked.timed_out || linked.exit_code != 0) {
             const std::string why = one_line(linked.stderr_text.empty() ? linked.stdout_text : linked.stderr_text, 400);
             result.details.push_back(std::string("[+0] 沙盒链接失败: ") + (linked.timed_out ? "timeout " : "") + why);
@@ -596,10 +668,20 @@ ScoreResult evaluate_code(const std::string& raw) {
             result.details.push_back("[+0] 运行超时");
             return result;
         }
+        if (!ran.error.empty() && ran.error.find("output exceeded") != std::string::npos) {
+            result.details.push_back("[+0] 运行输出过大: " + ran.error);
+            return result;
+        }
         const auto marker = ran.stdout_text.rfind("RES_JSON:");
         if (marker == std::string::npos) {
             const std::string why = one_line(ran.stderr_text, 200);
             result.details.push_back("[+0] 运行未能返回测试结果" + (why.empty() ? "" : " " + why));
+            return result;
+        }
+        // Only trust RES_JSON when the harness process exited 0. Non-zero can forge passed.
+        if (ran.exit_code != 0) {
+            result.details.push_back("[+0] 沙盒进程非零退出 (exit=" + std::to_string(ran.exit_code) +
+                                     ")，忽略可能伪造的 RES_JSON");
             return result;
         }
         const auto json_begin = ran.stdout_text.find('{', marker);
@@ -630,7 +712,12 @@ ScoreResult evaluate_code(const std::string& raw) {
             result.details.push_back("[+0] 沙盒测试未通过: " + one_line(failed, 300));
         }
     } catch (const std::exception& ex) {
-        result.details.push_back(std::string("[+0] 运行异常: ") + ex.what());
+        const std::string msg = ex.what();
+        if (msg.find("mkdtemp") != std::string::npos) {
+            result.details.push_back(std::string("[ENV_ERROR][+0] ") + msg);
+        } else {
+            result.details.push_back(std::string("[+0] 运行异常: ") + msg);
+        }
     }
     return result;
 }

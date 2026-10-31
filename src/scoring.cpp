@@ -265,7 +265,10 @@ ScoreResult evaluate_long_context(const std::string& raw) {
     } else {
         result.details.push_back("[+0] 超时参数错");
     }
-    if (tail.find("5") != std::string::npos) {
+    // Do not match a bare "5": HMAC-SHA256 / 85ms also contain the digit.
+    // Prefer whole phrases from the needle / answer template.
+    if (contains_any(tail, {"最大重试 5", "最大重传 5", "重试 5 次", "重传 5 次", "最大重传次数】：5",
+                            "最大重传次数】:5", "Max_Retries】：5", "Max_Retries: 5"})) {
         result.score += 20;
         result.details.push_back("[+20] 跨段落继承基准最大重试次数 5 次");
     } else {

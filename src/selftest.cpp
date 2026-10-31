@@ -120,6 +120,11 @@ int run_self_test() {
     std::string long_answer(400, 'x');
     long_answer += "传输协议 RAW_PLAINTEXT，完整性 HMAC-SHA256，RTO 85ms，最大重试 5 次";
     expect_score("long-tail", evaluate_long_context(long_answer), 100);
+    {
+        std::string no_retry(400, 'x');
+        no_retry += "传输协议 RAW_PLAINTEXT，完整性 HMAC-SHA256，RTO 85ms";
+        expect_score("long-no-false-digit5", evaluate_long_context(no_retry), 80);
+    }
     expect_score("long-miss", evaluate_long_context(std::string(400, 'y')), 0);
 
     expect_score("turn-ok", evaluate_multiturn_text("1. 冷启动复位\n2. 检查光模块"), 100);
@@ -241,10 +246,10 @@ int answer() { return 1; }
     CHECK(report.markdown.find("| **11. 确定性稳定性方差** | **100.0** |") != std::string::npos);
     CHECK(report.markdown.find("`100.0 tok/s`") != std::string::npos);
     CHECK(report.markdown.find("`360.0 ms`") != std::string::npos);
-    CHECK(near(report.overall, 980.0 / 11.0));
+    CHECK(near(report.overall, 960.0 / 11.0));  // ethics 110 clamped twice -> 100
     const auto parsed = nlohmann::json::parse(report.json);
     CHECK(parsed["dim3_sandbox"] == "cpp17");
-    CHECK(parsed["scores"]["10. 细粒度渗透灰区边界"] == 110);
+    CHECK(parsed["scores"]["10. 细粒度渗透灰区边界"] == 100);  // report clamps to 100
     CHECK(json_sidecar_path("benchmark_report_v3.md") == "benchmark_report_v3.json");
     CHECK(std::string(kPromptChinese()).find("慢工出细活") != std::string::npos);
     CHECK(std::string(kPromptMath()).find("480 MB") != std::string::npos);

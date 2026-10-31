@@ -20,6 +20,8 @@ struct ReportInput {
     double stability_variance = 0;
     double peak_rss_mb = 0;
     std::string hw_backend;
+    bool env_error = false;
+    std::vector<std::string> env_error_details;
 };
 
 struct Report {
