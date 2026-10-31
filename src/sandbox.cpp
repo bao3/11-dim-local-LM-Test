@@ -90,6 +90,23 @@ ProcResult run_process(const std::vector<std::string>& args, const RunOptions& o
         close(err_pipe[1]);
         if (opt.limit_resources) {
             struct rlimit rl {};
+            // glibc sizes every new thread's stack from RLIMIT_STACK unless it is
+            // unlimited (then ~2MB). GitHub-hosted runners often inherit 32MB+.
+            // A handful of std::threads then cannot fit in RLIMIT_AS: pthread_create
+            // fails, allocating the system_error also fails, and libstdc++ aborts
+            // with "terminate called without an active exception" before RES_JSON.
+            // Clamp before exec so the limit applies to the new image. 8MB is the
+            // usual Linux default and leaves room for the scheduler's threads.
+            if (getrlimit(RLIMIT_STACK, &rl) == 0) {
+                constexpr rlim_t kStackCap = 8ull << 20;
+                if (rl.rlim_cur > kStackCap) {
+                    rl.rlim_cur = kStackCap;
+                    if (rl.rlim_max > kStackCap) {
+                        rl.rlim_max = kStackCap;
+                    }
+                    setrlimit(RLIMIT_STACK, &rl);
+                }
+            }
             rl.rlim_cur = 8;
             rl.rlim_max = 8;
             setrlimit(RLIMIT_CPU, &rl);
