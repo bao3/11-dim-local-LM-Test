@@ -22,6 +22,8 @@ struct ReportInput {
     std::string hw_backend;
     bool env_error = false;
     std::vector<std::string> env_error_details;
+    std::string dim3_compiler;
+    std::string dim3_compiler_version;
 };
 
 struct Report {

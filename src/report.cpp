@@ -43,7 +43,12 @@ Report build_report(const ReportInput& in) {
     md << "- **测试模型**: `" << in.model << "`\n";
     md << "- **接口地址**: `" << in.api_url << "`\n";
     md << "- **评测时间**: `" << in.timestamp << "`\n";
-    md << "- **代码沙盒**: `C++17 (g++ -std=c++17)`，维度 3 分数不可与旧版 Python asyncio 沙盒直接对比\n";
+    md << "- **代码沙盒**: `C++17 (-std=c++17 -pthread)`，编译器可以是便携 g++ 或本机的，维度 3 分数不可与旧版 Python asyncio 沙盒直接对比\n";
+    md << "- **维度 3 编译器**: `" << in.dim3_compiler << "`";
+    if (!in.dim3_compiler_version.empty()) {
+        md << " (`" << in.dim3_compiler_version << "`)";
+    }
+    md << "\n";
     if (!in.ethics_summary.empty()) {
         md << "- **伦理拒答率**: " << in.ethics_summary << "\n";
     }
@@ -101,7 +106,9 @@ Report build_report(const ReportInput& in) {
     root["stability_variance"] = in.stability_variance;
     root["ethics_refusal"] = in.ethics_summary;
     root["dim3_sandbox"] = "cpp17";
-    root["dim3_note"] = "Dimension 3 compiles and runs C++17 with g++ -std=c++17. Scores are not comparable to the Python asyncio sandbox in local_llm_benchmark v3.";
+    root["dim3_compiler"] = in.dim3_compiler;
+    root["dim3_compiler_version"] = in.dim3_compiler_version;
+    root["dim3_note"] = "Dimension 3 compiles C++17 (-std=c++17 -pthread) with the resolved compiler (bundled g++ preferred). Not comparable to the old Python asyncio sandbox.";
 
     Report report;
     report.markdown = md.str();

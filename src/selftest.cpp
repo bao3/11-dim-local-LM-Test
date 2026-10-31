@@ -3,6 +3,7 @@
 #include "http.hpp"
 #include "long_context.hpp"
 #include "prompt_data.hpp"
+#include "paths.hpp"
 #include "report.hpp"
 #include "sandbox.hpp"
 #include "scoring.hpp"
@@ -10,9 +11,13 @@
 
 #include <nlohmann/json.hpp>
 
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -31,6 +36,173 @@ void check(bool cond, const char* expr, const char* file, int line) {
 }
 
 #define CHECK(cond) check(static_cast<bool>(cond), #cond, __FILE__, __LINE__)
+
+struct EnvRestore {
+    const char* key;
+    bool had = false;
+    std::string old;
+    explicit EnvRestore(const char* k) : key(k) {
+        if (const char* v = std::getenv(k)) {
+            had = true;
+            old = v;
+        }
+    }
+    EnvRestore(const EnvRestore&) = delete;
+    EnvRestore& operator=(const EnvRestore&) = delete;
+    void set(const char* value) const { setenv(key, value, 1); }
+    void clear() const { unsetenv(key); }
+    ~EnvRestore() {
+        if (had) {
+            setenv(key, old.c_str(), 1);
+        } else {
+            unsetenv(key);
+        }
+    }
+};
+
+bool write_fake_compiler(const std::filesystem::path& bin_path) {
+    std::error_code ec;
+    std::filesystem::create_directories(bin_path.parent_path(), ec);
+    if (ec) {
+        return false;
+    }
+    std::ofstream out(bin_path, std::ios::binary);
+    if (!out) {
+        return false;
+    }
+    out << "#!/bin/sh\n"
+           "if [ \"$1\" = \"--version\" ]; then\n"
+           "  echo 'g++ (ps5ai fake) 1.0'\n"
+           "  exit 0\n"
+           "fi\n"
+           "exit 0\n";
+    out.close();
+    return static_cast<bool>(out) && chmod(bin_path.c_str(), 0755) == 0;
+}
+
+void check_eq(const std::string& got, const std::string& expected, const char* label) {
+    if (got != expected) {
+        std::cerr << "FAIL " << label << " got [" << got << "] expected [" << expected << "]\n";
+        ++g_fails;
+    }
+}
+
+void check_compiler_probe() {
+    const std::string exe_dir = executable_dir();
+    CHECK(!exe_dir.empty());
+    if (!exe_dir.empty()) {
+        CHECK(access((exe_dir + "/ps5ai-11dim").c_str(), X_OK) == 0);
+    }
+
+    EnvRestore cxx_env("PS5AI_CXX");
+    EnvRestore gxx_env("PS5AI_GXX");
+    EnvRestore tc_env("PS5AI_TOOLCHAIN");
+    cxx_env.clear();
+    gxx_env.clear();
+    tc_env.clear();
+
+    char tmpl[] = "/tmp/ps5ai-probe-XXXXXX";
+    char* made = mkdtemp(tmpl);
+    CHECK(made != nullptr);
+    if (made == nullptr) {
+        return;
+    }
+    const std::filesystem::path fake_root(made);
+    const std::filesystem::path fake_gxx = fake_root / "bin" / "g++";
+    const bool wrote = write_fake_compiler(fake_gxx);
+    CHECK(wrote);
+    char tmpl_alt[] = "/tmp/ps5ai-probe-alt-XXXXXX";
+    char* made_alt = mkdtemp(tmpl_alt);
+    CHECK(made_alt != nullptr);
+    const std::filesystem::path alt_gxx = made_alt == nullptr
+                                               ? std::filesystem::path()
+                                               : std::filesystem::path(made_alt) / "alt-g++";
+    const bool wrote_alt = made_alt != nullptr && write_fake_compiler(alt_gxx);
+    CHECK(wrote_alt);
+    struct FakeGuard {
+        std::filesystem::path root;
+        ~FakeGuard() {
+            if (root.empty()) {
+                return;
+            }
+            std::error_code ec;
+            std::filesystem::remove_all(root, ec);
+        }
+    } guard{fake_root};
+    FakeGuard guard_alt{made_alt == nullptr ? std::filesystem::path() : std::filesystem::path(made_alt)};
+    if (!wrote || !wrote_alt) {
+        return;
+    }
+
+    const bool have_usr_gxx = access("/usr/bin/g++", X_OK) == 0;
+    if (have_usr_gxx) {
+        cxx_env.set("/tmp/ps5ai-missing-cxx-not-real");
+        gxx_env.clear();
+        tc_env.clear();
+        check_eq(resolve_cxx_compiler(), "/usr/bin/g++", "missing PS5AI_CXX falls through");
+
+        cxx_env.set("/usr/bin/g++");
+        gxx_env.set(fake_gxx.c_str());
+        tc_env.set(fake_root.c_str());
+        check_eq(resolve_cxx_compiler(), "/usr/bin/g++", "PS5AI_CXX beats GXX and toolchain");
+        CHECK(last_resolved_cxx() == "/usr/bin/g++");
+        CHECK(cxx_version_line("/usr/bin/g++").find("g++") != std::string::npos);
+    }
+
+    cxx_env.clear();
+    gxx_env.set(alt_gxx.c_str());
+    tc_env.set(fake_root.c_str());
+    check_eq(resolve_cxx_compiler(), alt_gxx.string(), "PS5AI_GXX beats toolchain");
+
+    cxx_env.clear();
+    gxx_env.clear();
+    tc_env.set(fake_root.c_str());
+    check_eq(resolve_cxx_compiler(), fake_gxx.string(), "PS5AI_TOOLCHAIN beats system");
+
+    const std::filesystem::path sibling = std::filesystem::path(exe_dir) / "toolchain";
+    const std::filesystem::path parent = std::filesystem::path(exe_dir) / ".." / "toolchain";
+    const bool sibling_was = std::filesystem::exists(sibling);
+    const bool parent_gxx_was = std::filesystem::exists(parent / "bin" / "g++");
+    if (!exe_dir.empty() && !sibling_was && !parent_gxx_was) {
+        cxx_env.clear();
+        gxx_env.clear();
+        tc_env.clear();
+        const std::filesystem::path sibling_gxx = sibling / "bin" / "g++";
+        CHECK(write_fake_compiler(sibling_gxx));
+        check_eq(resolve_cxx_compiler(), sibling_gxx.string(), "sibling toolchain");
+        std::error_code ec;
+        std::filesystem::remove_all(sibling, ec);
+
+        const std::filesystem::path parent_gxx = parent / "bin" / "g++";
+        CHECK(write_fake_compiler(parent_gxx));
+        const std::string parent_probe = exe_dir + "/../toolchain/bin/g++";
+        check_eq(resolve_cxx_compiler(), parent_probe, "parent toolchain");
+        std::filesystem::remove(parent_gxx, ec);
+        std::filesystem::remove(parent / "bin", ec);
+    }
+
+    cxx_env.clear();
+    gxx_env.clear();
+    tc_env.clear();
+    if (have_usr_gxx) {
+        check_eq(resolve_cxx_compiler(), "/usr/bin/g++", "system g++ after cleanup");
+    }
+
+    ReportInput in;
+    in.model = "t";
+    in.api_url = "http://127.0.0.1/v1/chat/completions";
+    in.timestamp = "t";
+    in.dim3_compiler = "/tmp/fake-g++";
+    in.dim3_compiler_version = "g++ (test) 1.0";
+    const Report r = build_report(in);
+    const auto parsed = nlohmann::json::parse(r.json);
+    CHECK(parsed["dim3_compiler"] == "/tmp/fake-g++");
+    CHECK(parsed["dim3_compiler_version"] == "g++ (test) 1.0");
+    CHECK(parsed["dim3_note"] ==
+          "Dimension 3 compiles C++17 (-std=c++17 -pthread) with the resolved compiler (bundled g++ preferred). Not comparable to the old Python asyncio sandbox.");
+    CHECK(r.markdown.find("**维度 3 编译器**: `/tmp/fake-g++`") != std::string::npos);
+    CHECK(r.markdown.find("(`g++ (test) 1.0`)") != std::string::npos);
+}
 
 bool near(double a, double b, double eps = 1e-6) {
     return std::fabs(a - b) <= eps;
@@ -249,6 +421,9 @@ int answer() { return 1; }
     CHECK(near(report.overall, 960.0 / 11.0));  // ethics 110 clamped twice -> 100
     const auto parsed = nlohmann::json::parse(report.json);
     CHECK(parsed["dim3_sandbox"] == "cpp17");
+    CHECK(parsed.contains("dim3_compiler"));
+    CHECK(parsed.contains("dim3_compiler_version"));
+    CHECK(report.markdown.find("**维度 3 编译器**:") != std::string::npos);
     CHECK(parsed["scores"]["10. 细粒度渗透灰区边界"] == 100);  // report clamps to 100
     CHECK(json_sidecar_path("benchmark_report_v3.md") == "benchmark_report_v3.json");
     CHECK(std::string(kPromptChinese()).find("慢工出细活") != std::string::npos);
@@ -256,6 +431,8 @@ int answer() { return 1; }
     CHECK(std::string(kPromptMath()).find("3.2") != std::string::npos);
 
     std::cout << "scoring checks " << (g_fails ? "failed" : "passed") << "\n";
+
+    check_compiler_probe();
 
     const std::string good_path = fixture("good_scheduler.cpp");
     const std::string bad_path = fixture("bad_scheduler.cpp");
