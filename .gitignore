@@ -1,5 +1,12 @@
 build/
+build-static/
+build-rel/
+dist/
 cmake-build-*/
+# Portable GCC is downloaded by scripts/fetch-toolchain.sh. Keep the placeholder only.
+/toolchain/**
+!/toolchain/README.md
+!/toolchain/.gitkeep
 *.o
 *.a
 *.so

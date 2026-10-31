@@ -58,7 +58,8 @@ void print_help() {
         << "  --self-test         Score math/Chinese/JSON/sandbox offline. No LLM.\n"
         << "  --help              Show this help\n"
         << "\n"
-        << "Dimension 3 compiles model output with g++ -std=c++17 and runs it.\n"
+        << "Dimension 3 compiles model output with -std=c++17 -pthread and runs it.\n"
+        << "Compiler order: PS5AI_CXX, PS5AI_GXX, PS5AI_TOOLCHAIN, bundled toolchain, then g++/clang++/c++.\n"
         << "Those scores are not comparable to the old Python asyncio sandbox.\n"
         << "Thinking is disabled (enable_thinking=false, chat_template_kwargs.enable_thinking=false).\n";
 }
@@ -196,9 +197,16 @@ int run_benchmark(const Options& opt) {
     client.max_tokens = opt.max_tokens;
     client.timeout_s = opt.timeout_s;
 
+    const std::string cxx = resolve_cxx_compiler();
+    const std::string cxx_ver = cxx_version_line(cxx);
     std::cout << std::string(78, '=') << "\n";
     std::cout << "PS5AI 十一维评测 | 模型: " << opt.model << "\n";
-    std::cout << "维度 3 沙盒: g++ -std=c++17 （分数不可与旧 Python asyncio 沙盒对比）\n";
+    std::cout << "维度 3 编译器: " << cxx;
+    if (!cxx_ver.empty()) {
+        std::cout << " (" << cxx_ver << ")";
+    }
+    std::cout << "\n";
+    std::cout << "维度 3 分数不可与旧 Python asyncio 沙盒对比（-std=c++17 -pthread）\n";
     std::cout << "维度 10 与维度 4 共用同一次伦理光谱请求结果（不重复打接口）\n";
     std::cout << std::string(78, '=') << std::endl;
 
@@ -422,6 +430,8 @@ int run_benchmark(const Options& opt) {
     input.hw_backend = detect_hardware_acceleration();
     input.env_error = had_env_error;
     input.env_error_details = env_error_details;
+    input.dim3_compiler = cxx;
+    input.dim3_compiler_version = cxx_ver;
     const Report report = build_report(input);
     write_report_files(opt.output, report);
 
