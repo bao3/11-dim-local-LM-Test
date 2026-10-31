@@ -1,0 +1,10 @@
+build/
+cmake-build-*/
+*.o
+*.a
+*.so
+ps5ai-11dim
+benchmark_report_v3.md
+benchmark_report_v3.json
+*.log
+.DS_Store
